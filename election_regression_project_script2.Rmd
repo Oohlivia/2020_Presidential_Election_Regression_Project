@@ -1,0 +1,130 @@
+---
+title: "Election Regression Project Script 2"
+author: "Olivia Wang"
+date: "7/27/2022"
+output: html_document
+---
+
+### Loading the train and test data set
+```{r}
+train <- read.csv("train.csv")
+test <- read.csv("test.csv")
+```
+
+### Removing duplicated columns
+```{r}
+index <- (1:215)[duplicated(as.list(train))]
+dup_cols <- train[,index]
+train <- train[!duplicated(as.list(train))]
+```
+
+### Drop observations with NAs
+```{r}
+library(tidyr)
+train <- train %>% drop_na()
+
+train_y <- train$percent_dem
+train_id <- train$id
+```
+
+### Remove the response variable
+```{r}
+train_x <- train[ , -2]
+```
+
+
+### PCA method for variable selection
+
+PCA plots axes are ranked in the order of importance, difference along the first principle component axis(PC1), are more important than the difference along the second principle component axis(PC2). If the difference between cluster are the same, then the cluster along PC1 are more different from cluster along PC2.
+
+```{r}
+library(FactoMineR)
+
+pca <- PCA(train[, -c(1:3)], scale.unit = TRUE, ncp = 10, graph = FALSE) #using the PCA function from the FactoMineR library to perform PCA method on the training data
+dimdesc(pca) -> vals # storing the correlation 
+
+
+## Check and remove correlations for each dimensions
+
+df1 <- data.frame(vals[["Dim.1"]][["quanti"]]) %>% filter(abs(correlation) >= .2)
+df1$Variable = rownames(df1)
+
+df2 <- data.frame(vals[["Dim.2"]][["quanti"]]) %>% filter(abs(correlation) >= .6)
+df2$Variable = rownames(df2)
+
+df3 <- data.frame(vals[["Dim.2"]][["quanti"]]) %>% filter(abs(correlation) >= .9)
+df3$Variable = rownames(df3)
+
+dat1 <- rbind(df1, df2, df3)
+
+colmn <- which(names(train) %in% dat1[, 3])
+PCA_new <- train[,colmn] # storing the new selected predictors into a new data frame
+PCA_new <- cbind(train_y,PCA_new)
+```
+
+
+### Creating folds and basic receipe
+```{r}
+# load needed libraries
+library(xgboost)
+library(rsample)
+library(tidymodels)
+
+set.seed(10) # set seed for reproducing results
+
+folds <- vfold_cv(PCA_new, 8) # split the training data into 8 folds
+
+reci <- recipe(train_y~.,data = PCA_new)  # the basic receipe we use
+```
+
+### XGB model with 149 predictors and making predictions
+```{r}
+set.seed(666) # set seed for reproducing results
+
+# xgboost model with our tuned hyper-parameters
+xgb_predict_model <- boost_tree( trees = 1000, tree_depth = 8, min_n = 5, loss_reduction = 5.638207e-10,
+                                 sample_size = 0.2351550, mtry = 131,learn_rate = 0.004848720) %>% set_engine("xgboost") %>% set_mode("regression")
+
+
+xgb_fit <- xgb_predict_model %>% fit(train_y~., data = PCA_new) # fit the model to our selected training data
+
+pred <- test$id %>% 
+  bind_cols(predict(xgb_fit, new_data = test)) # making predictions
+
+colnames(pred) <- c("Id", "Predicted")
+
+write_csv(pred, "xgb_pred") # storing the predicted data
+```
+
+### sort the predictors in the xgboost model by its importance
+```{r}
+train_matrix <- data.matrix(PCA_new)
+mat <- xgb.importance (names(train_matrix),model = xgb_fit$fit) # sort the predictors in the xgboost model by its importance
+```
+
+
+### create sgb model with the 80 most important predictors
+```{r}
+
+var_80 <- PCA_new[,colnames(PCA_new) %in% mat$Feature[1:80]] # select the top 80 most important predictors
+
+var_80 <- cbind(train_y,var_80) # bind them with our response variable
+
+reci <- recipe(train_y~.,data = var_80)  # the receipe we use in this model
+
+set.seed(666)
+
+# xgboost model with our tuned hyper-parameters
+xgb_predict_model_80 <- boost_tree(trees = 1000, tree_depth = 6, min_n = 11, loss_reduction = 2.166431e-10,
+                                 sample_size = 0.3461942, mtry = 27,learn_rate = 0.021839515) %>% set_engine("xgboost") %>% set_mode("regression")
+
+
+xgb_fit_80 <- xgb_predict_model_80 %>% fit(train_y~., data = var_80) # fit the model to our selected training data
+
+pred_80 <- test$id %>% 
+  bind_cols(predict(xgb_fit_80, new_data = test))
+
+colnames(pred_80) <- c("Id", "Predicted")
+
+write_csv(pred_80, "xgb_pred_80")
+```

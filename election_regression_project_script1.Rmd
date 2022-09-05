@@ -1,0 +1,515 @@
+---
+title: "Election Regression Project Script 1"
+author: "Olivia Wang"
+output: pdf_document
+date: '2022-07-22'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Project goal: The goal is to predict the percentage of voters
+in a county that voted for Biden in the 2020 US Presidential Election. Predictor columns are demographic and education information for each county. 
+
+```{r}
+library(readr)
+train <- read_csv("train.csv")
+test <- read_csv("test.csv")
+```
+
+
+## Exploratory
+
+### 1. Remove identical cols
+```{r}
+index <- (1:215)[duplicated(as.list(train))]
+dup_cols <- train[,index]
+train <- train[!duplicated(as.list(train))]
+```
+
+### 2. Drop observations with NAs
+```{r}
+library(tidyr)
+train <- train %>% drop_na()
+
+train_y <- train$percent_dem
+train_id <- train$id
+train_x <- train[ , -2]
+```
+
+
+### 5. Variable selection with LASSO
+```{r}
+# reference: https://www.youtube.com/watch?v=5GZ5BHOugBQ
+# install.packages("glmnet")
+library(glmnet)
+library(caret)
+
+set.seed(100)
+ctrlspecs <- trainControl(method = "cv", number = 10, savePredictions = "all")
+
+lambda_grid <- 10^seq(5, -5, length = 500)
+
+lasso_select_mod <- train(percent_dem ~.,
+                          data = train[, -1],
+                          preProcess = c("center", "scale"),
+                          method = "glmnet", 
+                          tuneGrid = expand.grid(alpha = 1, lambda = lambda_grid), 
+                          trControl = ctrlspecs)
+best_lambda <- lasso_select_mod$bestTune$lambda
+as.vector(coef(lasso_select_mod$finalModel, best_lambda) != 0)
+
+```
+
+
+```{r}
+plot(log(lasso_select_mod$results$lambda),
+     lasso_select_mod$results$RMSE,
+     xlim = c(-10, 0),
+     xlab = "log(lambda)", 
+     ylab = "RMSE")
+```
+log(lambda) is optimal around -6.3. 
+So the optimal lambda is `r best_lambda`
+
+```{r}
+# variable importance
+ varImp(lasso_select_mod)
+```
+
+```{r}
+library(ggplot2)
+ggplot(varImp(lasso_select_mod))
+```
+
+### Boruta
+```{r}
+# # !!!!!!!!!
+# #install.packages("Boruta")
+# library(Boruta)
+# boruta_output <- Boruta(train_y ~ ., data=na.omit(train_data), doTrace=0) 
+# boruta_signif <- getSelectedAttributes(boruta_output, withTentative = TRUE)
+# print(boruta_signif)  
+# # https://www.machinelearningplus.com/machine-learning/feature-selection/
+```
+
+```{r}
+# library(Boruta)
+# 
+# roughFixMod <- TentativeRoughFix(boruta_output)
+# boruta_signif <- getSelectedAttributes(roughFixMod)
+# print(boruta_signif)
+# imps <- attStats(roughFixMod)
+# imps2 = imps[imps$decision != 'Rejected', c('meanImp', 'decision')]
+# head(imps2[order(-imps2$meanImp), ])  # descending sort
+```
+
+```{r}
+# boruta_res <- read_csv("boruta(1).csv")
+# names <- boruta_res$...1[boruta_res$meanImp > 5.5]
+# 
+# 
+# train_X <- train_x[, names]
+# train_data <- data.frame(train_y, train_X)
+```
+
+
+
+### PCA
+```{r}
+pc <- prcomp(train_x[, -1], center = TRUE, scale. = TRUE)
+#summary(pc)
+pc$rotation
+```
+
+```{r}
+cor(pc$x)
+```
+
+```{r}
+pc_y <- cbind(train_y, data.frame(pc$x))
+cor(pc_y)[, 1]
+```
+
+```{r}
+pc_lm <- lm(train_y ~. , data = pc_y)
+summary(pc_lm)
+```
+
+
+## Preprocessiong and Recipes
+```{r}
+library(tidymodels)
+# Basic recipe
+basic_rec <- recipe(percent_dem ~., data = train) %>% 
+  prep()
+
+# Logarithmic recipe
+log_rec <- basic_rec %>% 
+  step_log(all_numeric_predictors(), base = 10, signed = TRUE) %>% 
+  prep()
+
+# Normalized recipe
+norm_rec <- basic_rec %>% 
+  step_normalize() %>% 
+  prep()
+
+# Preprocessing 
+preproc <- 
+  list(basic = basic_rec, 
+       log = log_rec,
+       norm = norm_rec)
+       #inter = inter_rec)
+
+# We also tried some interactions terms but they showed no improvements
+```
+
+## Cadidates Model
+```{r}
+library(tidymodels)
+library(kknn)
+library(ranger)
+library(xgboost)
+#install.packages("xgboost")
+
+# Linear Regression Model
+lm_model <- 
+  linear_reg() %>% 
+  set_engine("lm") %>% 
+  set_mode("regression")
+
+# K-nearest Neighbors regression model
+knn_model <- nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>% 
+  set_mode("regression")
+
+
+# Elastic Net model with tuning penalty 
+elastic_model <- 
+  linear_reg(penalty = tune(), mixture = tune()) %>% 
+  set_engine("glmnet")
+
+# Random Forest regression model with tuning
+rf_model <- 
+  rand_forest(mtry = tune(), trees = tune(), min_n = tune()) %>% 
+  set_engine("ranger") %>% 
+  set_mode("regression")
+
+
+# Decision tree regression model with tuning
+dt_model <- 
+  decision_tree(tree_depth = tune(), cost_complexity = tune(), min_n = tune()) %>% 
+  set_engine("rpart") %>% 
+  set_mode("regression")
+
+# XGBoost with tuning
+xgb_model <- boost_tree(trees = 1000,
+                        tree_depth = tune(),
+                        min_n = tune(), 
+                        loss_reduction = tune(),
+                        sample_size = tune(),
+                        mtry = tune(), 
+                        learn_rate = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+```
+
+
+
+## Model evaluation and tuning
+
+### Cross Validation
+```{r}
+set.seed(100)
+folds <- vfold_cv(train, 10)
+keep_pred <- control_resamples(save_pred = TRUE, save_workflow = TRUE)
+```
+
+### Tuning for hyperparameters
+```{r}
+# knn model tuning with basic rec
+knn_grid <- grid_regular(neighbors(range(1, 100)), levels = 10)
+knn_wflow_basic <- workflow() %>% add_recipe(basic_rec) %>% add_model(knn_model)
+knn_res_basic <- knn_wflow_basic %>% tune_grid(
+    resamples = folds, 
+    grid = knn_grid
+  )
+knn_res_basic %>% show_best("rmse")
+
+# knn model tuning with log rec
+knn_wflow_log <- workflow() %>% add_recipe(log_rec) %>% add_model(knn_model)
+knn_res_log <- knn_wflow_log %>% tune_grid(
+    resamples = folds, 
+    grid = knn_grid
+  )
+knn_res_log %>% show_best("rmse")
+
+# knn model tuning with norm rec
+knn_wflow_norm <- workflow() %>% add_recipe(norm_rec) %>% add_model(knn_model)
+knn_res_norm <- knn_wflow_log %>% tune_grid(
+    resamples = folds, 
+    grid = knn_grid
+  )
+knn_res_norm %>% show_best("rmse")
+
+# knn model tuning with norm rec
+knn_wflow_norm <- workflow() %>% add_recipe(norm_rec) %>% add_model(knn_model)
+knn_res_norm <- knn_wflow_norm %>% tune_grid(
+    resamples = folds, 
+    grid = knn_grid
+  )
+knn_res_norm %>% show_best("rmse")
+
+
+```
+K = 12 seems to be the best K value. 
+
+```{r}
+# Elastic net tuning with basic rec
+param <- parameters(penalty(range(-5, 5)), mixture())
+elastic_grid <- grid_regular(param, level = 500)
+elastic_wflow_basic <- workflow() %>% add_recipe(basic_rec) %>% add_model(elastic_model)
+elastic_res_basic <- elastic_wflow_basic %>% tune_grid(
+    resamples = folds,
+    grid = elastic_grid
+  )
+elastic_res_basic %>% show_best("rmse")
+
+# Elastic net tuning with log rec
+elastic_wflow_log <- workflow() %>% add_recipe(log_rec) %>% add_model(elastic_model)
+elastic_res_log <- elastic_wflow_log %>% tune_grid(
+  resamples = folds,
+  grid = elastic_grid
+)
+elastic_res_log %>% show_best("rmse")
+
+# Elastic net tuning with norm rec
+elastic_wflow_norm <- workflow() %>% add_recipe(norm_rec) %>% add_model(elastic_model)
+elastic_res_norm <- elastic_wflow_norm %>% tune_grid(
+  resamples = folds, 
+  grid = elastic_grid
+)
+elastic_res_norm %>% show_best("rmse")
+```
+Penalty 1e-05, mixture = 1, 0.5, 0
+
+```{r}
+# decision tree model tuning with basic rec
+set.seed(1999)
+param <- parameters(tree_depth(range(1, 30)),
+                    cost_complexity(range = c(-2, -.5),
+                                    trans = log10_trans()), 
+                    min_n(range(1, 100)))
+dt_grid <- grid_regular(param, level = 10)
+dt_wflow_basic <- workflow() %>% add_recipe(basic_rec) %>% add_model(dt_model)
+dt_res_basic <- dt_wflow_basic %>% tune_grid(
+    resamples = folds,
+    grid = dt_grid
+  )
+dt_res_basic %>% show_best("rmse")
+
+# decision tree model tuning with log rec
+dt_wflow_log <- workflow() %>% add_recipe(log_rec) %>% add_model(dt_model)
+dt_res_log <- dt_wflow_log %>% tune_grid(
+    resamples = folds,
+    grid = dt_grid
+  )
+dt_res_log %>% show_best("rmse")
+
+# decision tree model tuning with norm rec
+dt_wflow_norm <- workflow() %>% add_recipe(norm_rec) %>% add_model(dt_model)
+dt_res_norm <- dt_wflow_norm %>% tune_grid(
+    resamples = folds,
+    grid = dt_grid
+  )
+dt_res_norm %>% show_best("rmse")
+```
+cost_complexity = 0.01, tree_depth = 15 or 30, min_n = 50
+
+
+```{r}
+# random forest tuning with basic recipe
+set.seed(1999)
+rf_grid <- grid_regular(mtry(range(40, 45)),
+                        trees(range(100, 200)),
+                        min_n(range(5, 10)),
+                           levels = 5)
+
+rf_wflow_basic <- workflow() %>% add_model(rf_model) %>% add_recipe(basic_rec)
+rf_fit_basic <- rf_wflow_basic %>% tune_grid(
+  resamples = folds, 
+  grid = rf_grid)
+
+rf_fit_basic %>% show_best("rmse")
+
+# random forest with log recipe
+rf_wflow_log <- workflow() %>% add_model(rf_model) %>% add_recipe(log_rec)
+rf_fit_log <- rf_wflow_log %>% tune_grid(
+  resamples = folds, 
+  grid = rf_grid)
+
+rf_fit_log %>% show_best("rmse")
+
+# random forest with norm recipe
+rf_wflow_norm <- workflow() %>% add_model(rf_model) %>% add_recipe(norm_rec)
+rf_fit_norm <- rf_wflow_log %>% tune_grid(
+  resamples = folds, 
+  grid = rf_grid)
+
+rf_fit_norm %>% show_best("rmse")
+
+
+```
+
+```{r}
+### XGBoost tuning with basic rec
+set.seed(100)
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), pca_y),
+  learn_rate(),
+  size = 30
+)
+
+xgb_wf_basic <- workflow() %>%
+  add_model(xgb_model) %>% 
+  add_recipe(basic_rec)
+
+xgb_fit_basic <- tune_grid(
+  xgb_wf_basic,
+  resamples = folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_fit_basic %>% show_best("rmse", 1)
+```
+
+```{r}
+### XGBoost tuning with log rec
+xgb_wf_log <- workflow() %>%
+  add_model(xgb_model) %>% 
+  add_recipe(log_rec)
+
+xgb_fit_log <- tune_grid(
+  xgb_wf_log,
+  resamples = folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_fit_log %>% show_best("rmse", 1)
+
+### XGBoost tuning with norm rec
+xgb_wf_norm <- workflow() %>%
+  add_model(xgb_model) %>% 
+  add_recipe(norm_rec)
+
+xgb_fit_norm <- tune_grid(
+  xgb_wf_norm,
+  resamples = folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_fit_norm %>% show_best("rmse", 1)
+```
+
+### Create workflow set
+```{r}
+# Update models
+library(tidymodels)
+knn_model <- nearest_neighbor(neighbors = 12) %>%
+  set_engine("kknn") %>% 
+  set_mode("regression")
+
+elastic_model_lasso <- 
+  linear_reg(penalty = 0.001394083, mixture = 1) %>% 
+  set_engine("glmnet")
+
+elastic_model_ridge <- 
+  linear_reg(penalty = 0.001394083, mixture = 0) %>% 
+  set_engine("glmnet")
+  
+elastic_model_mix <- 
+  linear_reg(penalty = 0.001394083, mixture = 0.5) %>% 
+  set_engine("glmnet")
+  
+rf_model <- 
+  rand_forest(mtry = 40, trees = 122, min_n = 6) %>% 
+  set_engine("ranger") %>% 
+  set_mode("regression")
+
+dt_model <- 
+  decision_tree(tree_depth = 15, cost_complexity = 0.01, min_n = 50) %>% 
+  set_engine("rpart") %>% 
+  set_mode("regression")
+
+xgb_model <- boost_tree(trees = 1000,
+                        tree_depth = 11,
+                        min_n = 16, 
+                        loss_reduction = 5.256629e-07,
+                        sample_size = 0.4614493,
+                        mtry = 21, 
+                        learn_rate = 0.009615246) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+```
+
+```{r}
+models <- list(
+  lm = lm_model,
+  knn = knn_model,
+  lasso = elastic_model_lasso,
+  ridge = elastic_model_ridge,
+  elastic = elastic_model_mix,
+  rf = rf_model,
+  xgb = xgb_model
+)
+
+all_models <- workflow_set(preproc = preproc, models = models, cross=TRUE)
+```
+
+```{r}
+all_models <- 
+  all_models %>% 
+  workflow_map("fit_resamples", 
+               seed = 100, verbose = TRUE,
+               resamples = folds, control = keep_pred)
+
+set.seed(100)
+rank_results(all_models, rank_metric = "rmse", select_best = TRUE)
+```
+  
+```{r}
+autoplot(all_models)
+```
+
+
+random forest with basic recipe or norm recipe has the lowest rmse value.
+
+### prediction
+```{r}
+set.seed(100)
+xgb_norm_wf <- workflow() %>% 
+  add_model(xgb_model) %>% 
+  add_recipe(norm_rec)
+
+xgb_norm_fit <- fit(xgb_norm_wf, train_data)
+
+pred <- test$id %>% 
+  bind_cols(predict(xgb_norm_fit, new_data = test))
+
+colnames(pred) <- c("Id", "Predicted")
+pred
+```
+
+```{r}
+write_csv(pred, "prediction_xgb_norm(0.06526325)")
+```
+
+
